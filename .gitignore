@@ -1,0 +1,22 @@
+# Secrets and Environment
+.env
+.env.local
+*.env
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Python caching
+__pycache__/
+*.py[cod]
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# ADK specific temp files
+.adk/
+logs/

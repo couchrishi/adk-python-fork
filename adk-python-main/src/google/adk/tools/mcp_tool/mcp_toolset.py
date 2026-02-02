@@ -1,0 +1,364 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import sys
+from typing import Any
+from typing import Awaitable
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import TextIO
+from typing import TypeVar
+from typing import Union
+import warnings
+
+from mcp import StdioServerParameters
+from mcp.types import ListResourcesResult
+from mcp.types import ListToolsResult
+from pydantic import model_validator
+from typing_extensions import override
+
+from ...agents.readonly_context import ReadonlyContext
+from ...auth.auth_credential import AuthCredential
+from ...auth.auth_schemes import AuthScheme
+from ..base_tool import BaseTool
+from ..base_toolset import BaseToolset
+from ..base_toolset import ToolPredicate
+from ..tool_configs import BaseToolConfig
+from ..tool_configs import ToolArgsConfig
+from .mcp_session_manager import MCPSessionManager
+from .mcp_session_manager import retry_on_errors
+from .mcp_session_manager import SseConnectionParams
+from .mcp_session_manager import StdioConnectionParams
+from .mcp_session_manager import StreamableHTTPConnectionParams
+from .mcp_tool import MCPTool
+
+logger = logging.getLogger("google_adk." + __name__)
+
+
+T = TypeVar("T")
+
+
+class McpToolset(BaseToolset):
+  """Connects to a MCP Server, and retrieves MCP Tools into ADK Tools.
+
+  This toolset manages the connection to an MCP server and provides tools
+  that can be used by an agent. It properly implements the BaseToolset
+  interface for easy integration with the agent framework.
+
+  Usage::
+
+    toolset = McpToolset(
+        connection_params=StdioServerParameters(
+            command='npx',
+            args=["-y", "@modelcontextprotocol/server-filesystem"],
+        ),
+        tool_filter=['read_file', 'list_directory']  # Optional: filter specific tools
+    )
+
+    # Use in an agent
+    agent = LlmAgent(
+        model='gemini-2.0-flash',
+        name='enterprise_assistant',
+        instruction='Help user accessing their file systems',
+        tools=[toolset],
+    )
+
+    # Cleanup is handled automatically by the agent framework
+    # But you can also manually close if needed:
+    # await toolset.close()
+  """
+
+  def __init__(
+      self,
+      *,
+      connection_params: Union[
+          StdioServerParameters,
+          StdioConnectionParams,
+          SseConnectionParams,
+          StreamableHTTPConnectionParams,
+      ],
+      tool_filter: Optional[Union[ToolPredicate, List[str]]] = None,
+      tool_name_prefix: Optional[str] = None,
+      errlog: TextIO = sys.stderr,
+      auth_scheme: Optional[AuthScheme] = None,
+      auth_credential: Optional[AuthCredential] = None,
+      require_confirmation: Union[bool, Callable[..., bool]] = False,
+      header_provider: Optional[
+          Callable[[ReadonlyContext], Dict[str, str]]
+      ] = None,
+  ):
+    """Initializes the McpToolset.
+
+    Args:
+      connection_params: The connection parameters to the MCP server. Can be:
+        ``StdioConnectionParams`` for using local mcp server (e.g. using ``npx`` or
+        ``python3``); or ``SseConnectionParams`` for a local/remote SSE server; or
+        ``StreamableHTTPConnectionParams`` for local/remote Streamable http
+        server. Note, ``StdioServerParameters`` is also supported for using local
+        mcp server (e.g. using ``npx`` or ``python3`` ), but it does not support
+        timeout, and we recommend to use ``StdioConnectionParams`` instead when
+        timeout is needed.
+      tool_filter: Optional filter to select specific tools. Can be either: - A
+        list of tool names to include - A ToolPredicate function for custom
+        filtering logic
+      tool_name_prefix: A prefix to be added to the name of each tool in this
+        toolset.
+      errlog: TextIO stream for error logging.
+      auth_scheme: The auth scheme of the tool for tool calling
+      auth_credential: The auth credential of the tool for tool calling
+      require_confirmation: Whether tools in this toolset require
+        confirmation. Can be a single boolean or a callable to apply to all
+        tools.
+      header_provider: A callable that takes a ReadonlyContext and returns a
+        dictionary of headers to be used for the MCP session.
+    """
+    super().__init__(tool_filter=tool_filter, tool_name_prefix=tool_name_prefix)
+
+    if not connection_params:
+      raise ValueError("Missing connection params in McpToolset.")
+
+    self._connection_params = connection_params
+    self._errlog = errlog
+    self._header_provider = header_provider
+
+    # Create the session manager that will handle the MCP connection
+    self._mcp_session_manager = MCPSessionManager(
+        connection_params=self._connection_params,
+        errlog=self._errlog,
+    )
+    self._auth_scheme = auth_scheme
+    self._auth_credential = auth_credential
+    self._require_confirmation = require_confirmation
+
+  async def _execute_with_session(
+      self,
+      coroutine_func: Callable[[Any], Awaitable[T]],
+      error_message: str,
+      readonly_context: Optional[ReadonlyContext] = None,
+  ) -> T:
+    """Creates a session and executes a coroutine with it."""
+    headers = (
+        self._header_provider(readonly_context)
+        if self._header_provider and readonly_context
+        else None
+    )
+    session = await self._mcp_session_manager.create_session(headers=headers)
+    timeout_in_seconds = (
+        self._connection_params.timeout
+        if hasattr(self._connection_params, "timeout")
+        else None
+    )
+    try:
+      return await asyncio.wait_for(
+          coroutine_func(session), timeout=timeout_in_seconds
+      )
+    except Exception as e:
+      raise ConnectionError(f"{error_message}: {e}") from e
+
+  @retry_on_errors
+  async def get_tools(
+      self,
+      readonly_context: Optional[ReadonlyContext] = None,
+  ) -> List[BaseTool]:
+    """Return all tools in the toolset based on the provided context.
+
+    Args:
+        readonly_context: Context used to filter tools available to the agent.
+            If None, all tools in the toolset are returned.
+
+    Returns:
+        List[BaseTool]: A list of tools available under the specified context.
+    """
+    # Fetch available tools from the MCP server
+    tools_response: ListToolsResult = await self._execute_with_session(
+        lambda session: session.list_tools(),
+        "Failed to get tools from MCP server",
+        readonly_context,
+    )
+
+    # Apply filtering based on context and tool_filter
+    tools = []
+    for tool in tools_response.tools:
+      mcp_tool = MCPTool(
+          mcp_tool=tool,
+          mcp_session_manager=self._mcp_session_manager,
+          auth_scheme=self._auth_scheme,
+          auth_credential=self._auth_credential,
+          require_confirmation=self._require_confirmation,
+          header_provider=self._header_provider,
+      )
+
+      if self._is_tool_selected(mcp_tool, readonly_context):
+        tools.append(mcp_tool)
+    return tools
+
+  async def read_resource(
+      self, name: str, readonly_context: Optional[ReadonlyContext] = None
+  ) -> Any:
+    """Fetches and returns the content of the named resource.
+
+    This method will handle content decoding based on the MIME type reported by
+    the MCP server (e.g., JSON, text, base64 for binary).
+
+    Args:
+      name: The name of the resource to fetch.
+      readonly_context: Context used to provide headers for the MCP session.
+
+    Returns:
+      The content of the resource, decoded based on MIME type and encoding.
+    """
+    result: Any = await self._execute_with_session(
+        lambda session: session.get_resource(name=name),
+        f"Failed to get resource {name} from MCP server",
+        readonly_context,
+    )
+
+    content = result.content
+    if result.encoding == "base64":
+      decoded_bytes = base64.b64decode(content)
+      if result.resource.mime_type == "application/json":
+        return json.loads(decoded_bytes.decode("utf-8"))
+      if result.resource.mime_type.startswith("text/"):
+        return decoded_bytes.decode("utf-8")
+      return decoded_bytes  # Return as bytes for other binary types
+
+    if result.resource.mime_type == "application/json":
+      return json.loads(content)
+
+    return content
+
+  async def list_resources(
+      self, readonly_context: Optional[ReadonlyContext] = None
+  ) -> list[str]:
+    """Returns a list of resource names available on the MCP server."""
+    result: ListResourcesResult = await self._execute_with_session(
+        lambda session: session.list_resources(),
+        "Failed to list resources from MCP server",
+        readonly_context,
+    )
+    return [resource.name for resource in result.resources]
+
+  async def get_resource_info(
+      self, name: str, readonly_context: Optional[ReadonlyContext] = None
+  ) -> dict[str, Any]:
+    """Returns metadata about a specific resource (name, MIME type, etc.)."""
+    result: ListResourcesResult = await self._execute_with_session(
+        lambda session: session.list_resources(),
+        "Failed to list resources from MCP server",
+        readonly_context,
+    )
+    for resource in result.resources:
+      if resource.name == name:
+        return resource.model_dump(mode="json", exclude_none=True)
+    raise ValueError(f"Resource with name '{name}' not found.")
+
+  async def close(self) -> None:
+    """Performs cleanup and releases resources held by the toolset.
+
+    This method closes the MCP session and cleans up all associated resources.
+    It's designed to be safe to call multiple times and handles cleanup errors
+    gracefully to avoid blocking application shutdown.
+    """
+    try:
+      await self._mcp_session_manager.close()
+    except Exception as e:
+      # Log the error but don't re-raise to avoid blocking shutdown
+      print(f"Warning: Error during McpToolset cleanup: {e}", file=self._errlog)
+
+  @override
+  @classmethod
+  def from_config(
+      cls: type[McpToolset], config: ToolArgsConfig, config_abs_path: str
+  ) -> McpToolset:
+    """Creates an McpToolset from a configuration object."""
+    mcp_toolset_config = McpToolsetConfig.model_validate(config.model_dump())
+
+    if mcp_toolset_config.stdio_server_params:
+      connection_params = mcp_toolset_config.stdio_server_params
+    elif mcp_toolset_config.stdio_connection_params:
+      connection_params = mcp_toolset_config.stdio_connection_params
+    elif mcp_toolset_config.sse_connection_params:
+      connection_params = mcp_toolset_config.sse_connection_params
+    elif mcp_toolset_config.streamable_http_connection_params:
+      connection_params = mcp_toolset_config.streamable_http_connection_params
+    else:
+      raise ValueError("No connection params found in McpToolsetConfig.")
+
+    return cls(
+        connection_params=connection_params,
+        tool_filter=mcp_toolset_config.tool_filter,
+        tool_name_prefix=mcp_toolset_config.tool_name_prefix,
+        auth_scheme=mcp_toolset_config.auth_scheme,
+        auth_credential=mcp_toolset_config.auth_credential,
+    )
+
+
+class MCPToolset(McpToolset):
+  """Deprecated name, use `McpToolset` instead."""
+
+  def __init__(self, *args, **kwargs):
+    warnings.warn(
+        "MCPToolset class is deprecated, use `McpToolset` instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    super().__init__(*args, **kwargs)
+
+
+class McpToolsetConfig(BaseToolConfig):
+  """The config for McpToolset."""
+
+  stdio_server_params: Optional[StdioServerParameters] = None
+
+  stdio_connection_params: Optional[StdioConnectionParams] = None
+
+  sse_connection_params: Optional[SseConnectionParams] = None
+
+  streamable_http_connection_params: Optional[
+      StreamableHTTPConnectionParams
+  ] = None
+
+  tool_filter: Optional[List[str]] = None
+
+  tool_name_prefix: Optional[str] = None
+
+  auth_scheme: Optional[AuthScheme] = None
+
+  auth_credential: Optional[AuthCredential] = None
+
+  @model_validator(mode="after")
+  def _check_only_one_params_field(self):
+    param_fields = [
+        self.stdio_server_params,
+        self.stdio_connection_params,
+        self.sse_connection_params,
+        self.streamable_http_connection_params,
+    ]
+    populated_fields = [f for f in param_fields if f is not None]
+
+    if len(populated_fields) != 1:
+      raise ValueError(
+          "Exactly one of stdio_server_params, stdio_connection_params,"
+          " sse_connection_params, streamable_http_connection_params must be"
+          " set."
+      )
+    return self
